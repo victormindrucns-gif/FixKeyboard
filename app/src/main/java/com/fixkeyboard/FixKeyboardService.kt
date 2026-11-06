@@ -1,13 +1,19 @@
 package com.fixkeyboard
 
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
@@ -48,27 +54,92 @@ class FixKeyboardService : InputMethodService() {
 
     private val autoCheck = Runnable { autoFix() }
 
-    // ---------- colours ----------
-    private val bg = Color.parseColor("#ECEFF1")
-    private val keyBg = Color.WHITE
-    private val modKeyBg = Color.parseColor("#CFD8DC")
-    private val accent = Color.parseColor("#2E7D32")
-    private val textCol = Color.parseColor("#212121")
+    // Keys we update in place (so Shift doesn't rebuild the whole keyboard)
+    private val letterKeys = ArrayList<Pair<TextView, String>>()
+    private var shiftKey: TextView? = null
+    private var fixKey: TextView? = null
+    private var busy = false
+
+    // Hold backspace to keep deleting
+    private val repeatDelete = object : Runnable {
+        override fun run() { onKey("⌫"); main.postDelayed(this, 55) }
+    }
+
+    // Suggestions + auto-capitals refresh once per burst of typing, not on every key
+    private val uiRefresh = Runnable {
+        val wasShift = shift
+        updateAutoShift()
+        if (wasShift != shift) refreshShift()
+        updateSuggestions()
+    }
+
+    // ---------- colours (follow the phone's light / dark mode) ----------
+    private var dark = false
+    private var bg = 0
+    private var keyBg = 0
+    private var keyPressed = 0
+    private var modKeyBg = 0
+    private var modPressed = 0
+    private var shadow = 0
+    private var accent = 0
+    private var accentPressed = 0
+    private var textCol = 0
+    private var subText = 0
+    private var panelGreen = 0
+    private var panelBlue = 0
+    private var divider = 0
+
+    private fun isNight() =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+
+    private fun applyTheme() {
+        dark = isNight()
+        fun c(s: String) = Color.parseColor(s)
+        if (dark) {
+            bg = c("#141518"); keyBg = c("#3A3B40"); keyPressed = c("#55565C")
+            modKeyBg = c("#26272B"); modPressed = c("#3A3B40"); shadow = c("#0A0A0C")
+            accent = c("#2FA36B"); accentPressed = c("#248556")
+            textCol = c("#F1F1F3"); subText = c("#9A9CA3")
+            panelGreen = c("#1D3328"); panelBlue = c("#1C2A3A"); divider = c("#33353A")
+        } else {
+            bg = c("#E9EBEF"); keyBg = Color.WHITE; keyPressed = c("#D5D8DE")
+            modKeyBg = c("#C9CDD4"); modPressed = c("#B3B8C0"); shadow = c("#A9AEB6")
+            accent = c("#1E8E5A"); accentPressed = c("#17714A")
+            textCol = c("#1C1D21"); subText = c("#5F6368")
+            panelGreen = c("#E3F4EA"); panelBlue = c("#E4EEFB"); divider = c("#CDD1D7")
+        }
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun rounded(color: Int) = GradientDrawable().apply {
-        setColor(color); cornerRadius = dp(6).toFloat()
+    private fun rounded(color: Int, radius: Int = 12) = GradientDrawable().apply {
+        setColor(color); cornerRadius = dp(radius).toFloat()
     }
+
+    /** A key face with a soft bottom shadow and a pressed colour. */
+    private fun keyDrawable(normal: Int, pressed: Int): Drawable {
+        fun face(col: Int) = LayerDrawable(arrayOf(rounded(shadow, 9), rounded(col, 9))).apply {
+            setLayerInset(1, 0, 0, 0, dp(1))
+        }
+        return StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), face(pressed))
+            addState(intArrayOf(), face(normal))
+        }
+    }
+
+    private val keyFont: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+    private val boldFont: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
     // ---------- UI ----------
 
     override fun onCreateInputView(): View {
         lang = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).getString(KEY_LANG, "en") ?: "en"
+        applyTheme()
+        chips.clear()
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
-            setPadding(dp(3), dp(3), dp(3), dp(6))
+            setPadding(dp(4), dp(2), dp(4), dp(8))
         }
 
         // Suggestion / status bar
@@ -78,7 +149,7 @@ class FixKeyboardService : InputMethodService() {
             layoutParams = LinearLayout.LayoutParams(-1, dp(42))
         }
         statusView = TextView(this).apply {
-            textSize = 13f; setTextColor(Color.parseColor("#546E7A"))
+            textSize = 13f; setTextColor(subText); typeface = keyFont
             setSingleLine(); ellipsize = TextUtils.TruncateAt.END
             setPadding(dp(8), 0, dp(8), 0)
             layoutParams = LinearLayout.LayoutParams(0, -1, 1f)
@@ -91,10 +162,20 @@ class FixKeyboardService : InputMethodService() {
         }
         bar.addView(undoChip)
         bar.addView(statusView)
-        repeat(3) {
-            val c = chip("")
-            c.layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply { setMargins(dp(2), dp(3), dp(2), dp(3)) }
-            c.visibility = View.GONE
+        repeat(3) { i ->
+            val c = TextView(this).apply {
+                textSize = 16f; setTextColor(textCol); gravity = Gravity.CENTER; typeface = keyFont
+                setSingleLine(); ellipsize = TextUtils.TruncateAt.END
+                background = StateListDrawable().apply {
+                    addState(intArrayOf(android.R.attr.state_pressed), rounded(modKeyBg, 8))
+                }
+                // thin divider on the left of the 2nd and 3rd suggestion
+                if (i > 0) foreground = LayerDrawable(arrayOf(GradientDrawable().apply { setColor(divider) })).apply {
+                    setLayerInset(0, 0, dp(12), 0, dp(12)); setLayerWidth(0, dp(1))
+                }
+                layoutParams = LinearLayout.LayoutParams(0, -1, 1f)
+                visibility = View.GONE
+            }
             c.setOnClickListener { pickSuggestion(c.text.toString()) }
             chips.add(c); bar.addView(c)
         }
@@ -104,7 +185,7 @@ class FixKeyboardService : InputMethodService() {
         rephrasePanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            background = rounded(Color.parseColor("#E8F5E9"))
+            background = rounded(panelGreen)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(3), 0, dp(3), dp(4)) }
         }
@@ -126,13 +207,13 @@ class FixKeyboardService : InputMethodService() {
         repliesPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            background = rounded(Color.parseColor("#E3F2FD"))
+            background = rounded(panelBlue)
             setPadding(dp(10), dp(6), dp(10), dp(6))
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(3), 0, dp(3), dp(4)) }
         }
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         repliesHeader = TextView(this).apply {
-            textSize = 12f; setTextColor(Color.parseColor("#1565C0")); setSingleLine()
+            textSize = 12f; setTextColor(subText); setSingleLine()
             ellipsize = TextUtils.TruncateAt.END
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
@@ -153,24 +234,27 @@ class FixKeyboardService : InputMethodService() {
     }
 
     private fun chip(label: String) = TextView(this).apply {
-        text = label; textSize = 15f; setTextColor(textCol); gravity = Gravity.CENTER
+        text = label; textSize = 14f; setTextColor(textCol); gravity = Gravity.CENTER
         setSingleLine(); ellipsize = TextUtils.TruncateAt.END
-        background = rounded(keyBg)
+        background = keyDrawable(modKeyBg, modPressed)
         setPadding(dp(10), 0, dp(10), 0)
         layoutParams = LinearLayout.LayoutParams(-2, -1).apply { setMargins(dp(2), dp(3), dp(2), dp(3)) }
     }
 
     private fun panelButton(label: String, bgc: Int, fg: Int, onClick: () -> Unit) = TextView(this).apply {
         text = label; textSize = 14f; setTextColor(fg); gravity = Gravity.CENTER
-        background = rounded(bgc)
-        layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(3), 0, dp(3), 0) }
+        background = keyDrawable(bgc, if (bgc == accent) accentPressed else modPressed)
+        typeface = boldFont
+        layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { setMargins(dp(3), 0, dp(3), 0) }
         setOnClickListener { onClick() }
     }
 
     private fun buildKeys() {
         keysBox.removeAllViews()
+        letterKeys.clear()
+        shiftKey = null
         fun chars(s: String) = s.map { it.toString() }
-        val bottom = listOf("?123", "🌐", ",", "space", ".", "Fix & Send")
+        val bottom = listOf("?123", "🌐", ",", "space", ".", "Fix & Send")  // 🌐 is drawn as EN / RO / RU
         val rows: List<List<String>> = if (!symbols) when (lang) {
             "ro" -> listOf(
                 chars("qwertyuiopă"),
@@ -200,7 +284,7 @@ class FixKeyboardService : InputMethodService() {
             val line = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(-1, dp(50))
+                layoutParams = LinearLayout.LayoutParams(-1, dp(54))
             }
             for (k in row) line.addView(makeKey(k))
             keysBox.addView(line)
@@ -208,29 +292,71 @@ class FixKeyboardService : InputMethodService() {
     }
 
     private fun makeKey(k: String): TextView {
-        val weight = when (k) { "space" -> 3.4f; "Fix & Send" -> 2.6f; "⇧", "⌫", "?123", "ABC" -> 1.5f; else -> 1f }
+        val weight = when (k) { "space" -> 3.6f; "Fix & Send" -> 2.2f; "⇧", "⌫", "?123", "ABC" -> 1.5f; "🌐" -> 1.1f; else -> 1f }
         val isLetter = k.length == 1 && k[0].isLetter()
+        val isAction = k == "Fix & Send"
+        val isMod = !isAction && (k.length > 1 || k == "⇧" || k == "⌫" || k == "↵")
         return TextView(this).apply {
             text = when {
                 k == "space" -> when (lang) { "ro" -> "Română"; "ru" -> "Русский"; else -> "English" }
+                k == "🌐" -> lang.uppercase()
+                isAction -> "Fix ➤"
+                k == "⇧" && shift -> "⬆"
                 isLetter && shift -> k.uppercase()
                 else -> k
             }
-            textSize = when (k) { "Fix & Send" -> 14f; "space" -> 12f; else -> 20f }
+            textSize = when {
+                isAction -> 16f
+                k == "space" -> 13f
+                k == "🌐" || k == "?123" || k == "ABC" -> 14f
+                isLetter -> 23f
+                else -> 21f
+            }
+            typeface = if (isAction || k == "🌐" || k == "?123" || k == "ABC") boldFont else keyFont
             gravity = Gravity.CENTER
-            setTextColor(if (k == "Fix & Send") Color.WHITE else textCol)
-            if (k == "Fix & Send") setTypeface(null, Typeface.BOLD)
-            background = rounded(
-                when {
-                    k == "Fix & Send" -> accent
-                    k == "⇧" && shift -> Color.parseColor("#90A4AE")
-                    k.length > 1 || k == "⇧" || k == "⌫" || k == "↵" -> modKeyBg
-                    else -> keyBg
+            includeFontPadding = false
+            setTextColor(when { isAction -> Color.WHITE; k == "space" -> subText; else -> textCol })
+            background = when {
+                isAction -> keyDrawable(accent, accentPressed)
+                k == "⇧" && shift -> keyDrawable(keyPressed, keyPressed)
+                isMod -> keyDrawable(modKeyBg, modPressed)
+                else -> keyDrawable(keyBg, keyPressed)
+            }
+            layoutParams = LinearLayout.LayoutParams(0, -1, weight).apply { setMargins(dp(3), dp(4), dp(3), dp(4)) }
+            if (isLetter) letterKeys.add(Pair(this, k))
+            if (k == "⇧") shiftKey = this
+            if (isAction) { fixKey = this; if (busy) text = "Checking…" }
+            // Typing keys fire the moment your finger touches them; action keys fire when you lift
+            val onRelease = isAction || k == "🌐" || k == "?123" || k == "ABC"
+            setOnTouchListener { v, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.isPressed = true
+                        v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        if (!onRelease) onKey(k)
+                        if (k == "⌫") main.postDelayed(repeatDelete, 400)
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.isPressed = false
+                        main.removeCallbacks(repeatDelete)
+                        if (onRelease) onKey(k)
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.isPressed = false
+                        main.removeCallbacks(repeatDelete)
+                    }
                 }
-            )
-            layoutParams = LinearLayout.LayoutParams(0, -1, weight).apply { setMargins(dp(2), dp(3), dp(2), dp(3)) }
-            setOnClickListener { onKey(k) }
-            if (k == "⌫") setOnLongClickListener { deleteWord(); true }
+                true
+            }
+        }
+    }
+
+    /** Switch letters between upper and lower case without rebuilding the keyboard. */
+    private fun refreshShift() {
+        for ((tv, k) in letterKeys) tv.text = if (shift) k.uppercase() else k
+        shiftKey?.apply {
+            text = if (shift) "⬆" else "⇧"
+            background = if (shift) keyDrawable(keyPressed, keyPressed) else keyDrawable(modKeyBg, modPressed)
         }
     }
 
@@ -239,6 +365,7 @@ class FixKeyboardService : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         if (!::root.isInitialized) return
+        if (isNight() != dark) { setInputView(onCreateInputView()) }
         hideRephrase()
         lastOriginal = null
         undoChip.visibility = View.GONE
@@ -258,8 +385,7 @@ class FixKeyboardService : InputMethodService() {
         repliesPanel.visibility = View.GONE
         val chat = IncomingMessages.recent(pkg) ?: return
         if (!fullText().isNullOrBlank()) return // you've already started typing
-        val apiKey = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
-            .getString(MainActivity.KEY_API, "")?.trim().orEmpty()
+        val apiKey = apiKey()
         if (apiKey.isEmpty()) return
 
         val last = chat.lines.last()
@@ -270,7 +396,7 @@ class FixKeyboardService : InputMethodService() {
 
         repliesList.removeAllViews()
         repliesList.addView(TextView(this).apply {
-            text = "Thinking of replies…"; textSize = 14f; setTextColor(Color.parseColor("#546E7A"))
+            text = "Thinking of replies…"; textSize = 14f; setTextColor(subText)
             setPadding(0, dp(6), 0, dp(6))
         })
         val seq = replySeq
@@ -290,15 +416,15 @@ class FixKeyboardService : InputMethodService() {
         for (r in replies) {
             repliesList.addView(TextView(this).apply {
                 text = r; textSize = 15f; setTextColor(textCol)
-                background = rounded(Color.WHITE)
-                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = keyDrawable(keyBg, keyPressed)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(3), 0, dp(3)) }
                 setOnClickListener {
                     // Put it in the box so you can tweak it, then Fix & Send
                     currentInputConnection?.commitText(r, 1)
                     repliesPanel.visibility = View.GONE
                     replySeq++
-                    updateAutoShift(); buildKeys(); updateSuggestions()
+                    updateAutoShift(); refreshShift(); updateSuggestions()
                     status("Edit it or tap Fix & Send")
                 }
             })
@@ -308,7 +434,9 @@ class FixKeyboardService : InputMethodService() {
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         main.removeCallbacks(autoCheck)
+        main.removeCallbacks(repeatDelete)
         checkSeq++
+        if (busy) setBusy(false)
     }
 
     // ---------- typing ----------
@@ -316,7 +444,7 @@ class FixKeyboardService : InputMethodService() {
     private fun onKey(k: String) {
         val ic = currentInputConnection ?: return
         when (k) {
-            "⇧" -> { shift = !shift; buildKeys() }
+            "⇧" -> { shift = !shift; refreshShift() }
             "⌫" -> {
                 val sel = ic.getSelectedText(0)
                 if (!sel.isNullOrEmpty()) ic.commitText("", 1) else ic.deleteSurroundingText(1, 0)
@@ -361,10 +489,13 @@ class FixKeyboardService : InputMethodService() {
         val delay = if (c == '.' || c == '!' || c == '?' || c == '\n') 300L else 1500L
         main.postDelayed(autoCheck, delay)
 
-        val wasShift = shift
-        updateAutoShift()
-        if (wasShift != shift) buildKeys()
-        updateSuggestions()
+        // Capital after . ! ? straight away; everything else refreshes once you pause for a moment
+        if (c == ' ' || c == null) {
+            main.removeCallbacks(uiRefresh); uiRefresh.run()
+        } else {
+            if (shift) { shift = false; refreshShift() }
+            main.removeCallbacks(uiRefresh); main.postDelayed(uiRefresh, 60)
+        }
     }
 
     /** Capitalise automatically at the start of a message or sentence. */
@@ -399,21 +530,43 @@ class FixKeyboardService : InputMethodService() {
 
     // ---------- text helpers ----------
 
-    private fun fullText(): String? =
-        currentInputConnection?.getExtractedText(ExtractedTextRequest(), 0)?.text?.toString()
+    private fun fullText(): String? {
+        val ic = currentInputConnection ?: return null
+        ic.getExtractedText(ExtractedTextRequest(), 0)?.text?.let { return it.toString() }
+        // Some apps don't share the whole box; read around the cursor instead
+        val before = ic.getTextBeforeCursor(10000, 0) ?: return null
+        val after = ic.getTextAfterCursor(10000, 0) ?: ""
+        return before.toString() + after.toString()
+    }
 
     private fun cursorAtEnd(): Boolean {
-        val et = currentInputConnection?.getExtractedText(ExtractedTextRequest(), 0) ?: return false
-        return et.selectionEnd == et.text?.length
+        val ic = currentInputConnection ?: return false
+        val et = ic.getExtractedText(ExtractedTextRequest(), 0)
+        if (et?.text != null) return et.selectionEnd == et.text.length
+        return ic.getTextAfterCursor(1, 0).isNullOrEmpty()
     }
 
     private fun replaceAll(newText: String) {
         val ic = currentInputConnection ?: return
-        val old = fullText() ?: return
         ic.beginBatchEdit()
-        ic.setSelection(0, old.length)
-        ic.commitText(newText, 1)
+        val et = ic.getExtractedText(ExtractedTextRequest(), 0)
+        if (et?.text != null) {
+            ic.setSelection(0, et.text.length)
+            ic.commitText(newText, 1)
+        } else {
+            val b = ic.getTextBeforeCursor(10000, 0)?.length ?: 0
+            val a = ic.getTextAfterCursor(10000, 0)?.length ?: 0
+            ic.deleteSurroundingText(b, a)
+            ic.commitText(newText, 1)
+        }
         ic.endBatchEdit()
+    }
+
+    /** Shows "Checking…" on the Fix key while it works, so you know it heard you. */
+    private fun setBusy(b: Boolean) {
+        busy = b
+        fixKey?.text = if (b) "Checking…" else "Fix ➤"
+        fixKey?.alpha = if (b) 0.75f else 1f
     }
 
     private fun status(s: String) {
@@ -425,30 +578,38 @@ class FixKeyboardService : InputMethodService() {
 
     private fun autoFix() {
         val text = fullText() ?: return
-        if (text.isBlank() || text.length < 3 || !cursorAtEnd()) return
+        if (text.isBlank() || text.trim().length < 3 || !cursorAtEnd()) return
+        // Don't touch the word you're still in the middle of typing
+        val endsClean = text.last().let { it.isWhitespace() || it in ".,!?;:" }
+        val key = apiKey()
+        if (key.isNotEmpty() && !endsClean) return // Claude checks once the word is finished
         val seq = ++checkSeq
         val language = GrammarChecker.languageFor(text, lang)
         Thread {
             try {
-                val matches = GrammarChecker.check(text, language)
-                main.post {
-                    if (seq != checkSeq || fullText() != text || !cursorAtEnd()) return@post
-                    // Don't touch the word you're still in the middle of typing
-                    val endsClean = text.last().let { it.isWhitespace() || it in ".,!?;:" }
+                var fixed: String
+                var n = 0
+                if (key.isNotEmpty()) {
+                    fixed = keepEdges(text, Rephraser.fix(key, text))
+                } else {
+                    val matches = GrammarChecker.check(text, language)
                     val wordStart = if (endsClean) text.length
                         else text.lastIndexOfAny(charArrayOf(' ', '\n')) + 1
-                    val safe = matches.filter { it.offset + it.length <= wordStart }
-                    val (fixed, n) = GrammarChecker.apply(text, safe)
-                    if (n > 0 && fixed != text) {
+                    val r = GrammarChecker.apply(text, matches.filter { it.offset + it.length <= wordStart })
+                    fixed = r.first; n = r.second
+                }
+                main.post {
+                    if (seq != checkSeq || fullText() != text || !cursorAtEnd()) return@post
+                    if (fixed != text) {
                         replaceAll(fixed)
                         lastOriginal = text
                         undoChip.visibility = View.VISIBLE
-                        status("Fixed $n ✓")
+                        status(if (n > 0) "Fixed $n ✓" else "Fixed ✓")
                     } else status("✓ Looks good")
-                    updateAutoShift(); buildKeys()
+                    updateAutoShift(); refreshShift()
                 }
             } catch (e: Exception) {
-                main.post { if (seq == checkSeq) status("No internet – can't check right now") }
+                main.post { if (seq == checkSeq) status(errorText(e)) }
             }
         }.start()
     }
@@ -466,43 +627,79 @@ class FixKeyboardService : InputMethodService() {
     // ---------- Fix & Send ----------
 
     private fun fixAndSend() {
-        if (rephraseShowing) return
+        if (busy) return
+        // Panel already open: tapping Fix ➤ again sends what's in the box
+        if (rephraseShowing) { hideRephrase(); send(); return }
         if (forceSendArmed) { forceSendArmed = false; send(); return }
         main.removeCallbacks(autoCheck)
 
-        val text = fullText() ?: return
+        val text = fullText()
+        if (text == null) { status("Can't read this text box – tap the app's Send"); return }
         if (text.isBlank()) { send(); return }
         val seq = ++checkSeq
+        setBusy(true)
         status("Checking…")
-        val apiKey = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
-            .getString(MainActivity.KEY_API, "")?.trim().orEmpty()
+        val apiKey = apiKey()
 
         val language = GrammarChecker.languageFor(text, lang)
         Thread {
             try {
-                val (fixed, n) = GrammarChecker.apply(text, GrammarChecker.check(text, language))
+                val fixed: String
+                var n = 0
                 var better: String? = null
                 if (apiKey.isNotEmpty()) {
-                    try { better = Rephraser.rephrase(apiKey, fixed) } catch (e: Exception) { }
+                    // One Claude call: the corrected message + a smoother version to choose from
+                    val r = Rephraser.fixAndImprove(apiKey, text)
+                    fixed = keepEdges(text, r.first)
+                    better = r.second
+                } else {
+                    val r = GrammarChecker.apply(text, GrammarChecker.check(text, language))
+                    fixed = r.first; n = r.second
                 }
                 main.post {
-                    if (seq != checkSeq || fullText() != text) return@post
-                    if (fixed != text) { replaceAll(fixed); lastOriginal = text }
+                    setBusy(false)
+                    if (seq != checkSeq) return@post
+                    if (fullText() != text) { status("You kept typing – tap Fix ➤ again"); return@post }
+                    if (fixed != text) {
+                        replaceAll(fixed); lastOriginal = text
+                        undoChip.visibility = View.VISIBLE
+                    }
                     if (better != null && norm(better) != norm(fixed)) {
                         showRephrase(better)
                     } else {
-                        status(if (n > 0) "Fixed $n ✓" else "✓ Looks good")
+                        status(if (fixed != text) (if (n > 0) "Fixed $n ✓" else "Fixed ✓") else "✓ Looks good")
                         send()
                     }
                 }
             } catch (e: Exception) {
                 main.post {
+                    setBusy(false)
                     if (seq != checkSeq) return@post
-                    status("No internet – tap Fix & Send again to send anyway")
+                    status(errorText(e) + " – tap Fix ➤ again to send anyway")
                     forceSendArmed = true
                 }
             }
         }.start()
+    }
+
+    private fun apiKey(): String = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+        .getString(MainActivity.KEY_API, "")?.trim().orEmpty()
+
+    /** Keep the spaces/new lines the person had at the start and end (the AI tends to trim them). */
+    private fun keepEdges(orig: String, fixed: String): String {
+        val lead = orig.substring(0, orig.length - orig.trimStart().length)
+        val trail = orig.substring(orig.trimEnd().length)
+        return lead + fixed.trim() + trail
+    }
+
+    private fun errorText(e: Exception): String {
+        val m = e.message ?: ""
+        return when {
+            m.contains("401") || m.contains("403") -> "Claude key not working – check it in the app"
+            m.contains("400") || m.contains("402") -> "Claude key problem – check your credit"
+            m.contains("429") || m.contains("529") -> "Claude is busy – try again in a moment"
+            else -> "No internet – can't check right now"
+        }
     }
 
     private fun norm(s: String) = s.trim().lowercase().replace(Regex("\\s+"), " ")
@@ -537,7 +734,8 @@ class FixKeyboardService : InputMethodService() {
             ic.performEditorAction(action)
             status("Sent ✓")
         } else {
-            status("✓ Ready – tap the app's Send button")
+            // e.g. WhatsApp: the keyboard isn't allowed to press the app's own Send button
+            status(statusView.text.toString().substringBefore(" –") + " – now tap the app's Send ➤")
         }
     }
 }

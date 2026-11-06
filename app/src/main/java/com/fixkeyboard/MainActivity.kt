@@ -44,8 +44,8 @@ class MainActivity : Activity() {
             }
         })
 
-        box.addView(label("3. Better-wording suggestions (optional)", 17f))
-        box.addView(label("Paste a Claude API key from console.anthropic.com. Without it you still get grammar fixes and word suggestions, just not the reworded version."))
+        box.addView(label("3. Claude API key (for real fixes)", 17f))
+        box.addView(label("Paste your Claude API key from console.anthropic.com. With it, Claude fixes your spelling, grammar and punctuation, suggests better wording, and writes smart replies. Without it, only a basic free checker is used."))
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val keyField = EditText(this).apply {
             hint = "sk-ant-…"
